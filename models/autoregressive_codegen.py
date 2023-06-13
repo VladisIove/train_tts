@@ -5,8 +5,8 @@ from transformers import GPT2PreTrainedModel, GPT2Config
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 from models.arch_util import AttentionBlock
-from models.lucidrains.x_transformers import TransformerWrapper, Decoder, Encoder
-# from trainer.networks import register_model
+from models.lucidrains.x_transformers import TransformerWrapper, Encoder, Decoder
+from trainer.networks import register_model
 
 
 class InferenceModel(GPT2PreTrainedModel):
@@ -86,13 +86,7 @@ class InferenceModel(GPT2PreTrainedModel):
         assert labels is None  # Training not supported by this inference model.
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        out = self.transformer.decoder(input_ids, full_context=self.context, return_embeddings=True, past_key_values=past_key_values,
-                                       use_cache=use_cache, expected_seq_len=150)
-        if use_cache:
-            hidden_states, present_key_values = out
-        else:
-            hidden_states = out
-            present_key_values = None
+        hidden_states = self.transformer.decoder(input_ids, context=self.context, return_embeddings=True)
         logits = self.transformer.decoder.to_logits(hidden_states)
 
         if not return_dict:
@@ -101,7 +95,7 @@ class InferenceModel(GPT2PreTrainedModel):
         return CausalLMOutputWithCrossAttentions(
             loss=None,
             logits=logits,
-            past_key_values=present_key_values,
+            past_key_values=None,
             hidden_states=hidden_states,
             attentions=None,
             cross_attentions=None,
@@ -163,14 +157,11 @@ class ConditioningEncoder(nn.Module):
 
 
 class AutoregressiveCodegen(nn.Module):
-    def __init__(self, model_dim, depth, num_text_tokens=256, num_mel_tokens=8194, dropout=.1):
+    def __init__(self, model_dim, encoder_depth, decoder_depth, num_text_tokens=256, num_mel_tokens=8194, dropout=.1, ff_mult=1):
         super().__init__()
-        assert depth >= 8  # This is the minimum bound to support the context interleaving that happens later.
 
         self.START_TOKEN=8192
         self.STOP_TOKEN=8193
-        self.START_TEXT_TOKEN = 255
-        self.STOP_TEXT_TOKEN = 0
         self.max_text_token_id = num_text_tokens
         self.max_mel_token_id = num_mel_tokens
         self.mel_embedding = ConditioningEncoder(80, model_dim, do_checkpointing=False)
@@ -179,32 +170,31 @@ class AutoregressiveCodegen(nn.Module):
                                   use_pos_emb=False,
                                   max_seq_len=-1,
                                   attn_layers = Encoder(
-                                      depth=depth,
+                                      depth=encoder_depth,
                                       heads=model_dim//64,
                                       dim=model_dim,
                                       attn_dropout=dropout,
                                       ff_dropout=dropout,
                                       use_rmsnorm=True,
                                       ff_glu=True,
-                                      ff_mult=1,
+                                      ff_mult=ff_mult,
                                       rotary_pos_emb=True,
                                       attn_rel_pos_bias=True,
                                   ))
-        self.encoder.norm = nn.Identity()  # This layer and the next are unused.
-        self.encoder.to_logits = nn.Identity()
+        self.encoder.to_logits = nn.Identity()  # This is unused.
         self.decoder = TransformerWrapper(
                                   num_tokens=num_mel_tokens,
                                   use_pos_emb=False,
                                   max_seq_len=-1,
                                   attn_layers=Decoder(
-                                      depth=depth,
+                                      depth=decoder_depth,
                                       heads=model_dim//64,
                                       dim=model_dim,
                                       attn_dropout=dropout,
                                       ff_dropout=dropout,
                                       use_rmsnorm=True,
                                       ff_glu=True,
-                                      ff_mult=1,
+                                      ff_mult=ff_mult,
                                       rotary_pos_emb=True,
                                       cross_attend=True,
                                       attn_rel_pos_bias=True,
@@ -234,58 +224,46 @@ class AutoregressiveCodegen(nn.Module):
         for i in range(conditioning_signal.shape[1]):
             cond_embs.append(self.mel_embedding(conditioning_signal[:, i]))
         cond_emb = torch.stack(cond_embs, dim=1).mean(dim=1, keepdim=True)
-        # Since all positional embeddings are relative, it is (probably) important to "fix" the text with some permanent embeddings.
-        text_codes = F.pad(text_codes, (1,0), value=self.START_TEXT_TOKEN)
-        text_codes = F.pad(text_codes, (0,1), value=self.STOP_TEXT_TOKEN)
-        _, enc_text = self.encoder(text_codes, return_hiddens=True)
-        # Interleave cond_emb into the first few contexts.
-        full_context = enc_text
-        full_context[1] = cond_emb
-        full_context[3] = cond_emb
-        full_context[6] = cond_emb
+        enc_text = self.encoder(text_codes, return_embeddings=True)
+        context = torch.cat([cond_emb, enc_text], dim=1)
 
         # Execute the decoder
         dec_inputs = F.pad(mel_codes, (1,0), value=self.START_TOKEN)[:, :-1]
-        dec = self.decoder(dec_inputs, full_context=full_context)
+        dec = self.decoder(dec_inputs, context=context)
         if not return_loss:
             return dec
         loss_mel = F.cross_entropy(dec.permute(0,2,1), mel_codes)
         return loss_mel
 
-    def generate(self, conditioning_signal, text_codes, max_tokens=256, **hf_generate_kwargs):
-        inference_model = InferenceModel(self)
-        # Build the context
+    def generate(self, conditioning_signal, text_codes, max_tokens=1024, **hf_generate_kwargs):
+        if not hasattr(self, 'inference_model'):
+            self.inference_model = InferenceModel(self)
+
         if len(conditioning_signal.shape) != 4:
             conditioning_signal = conditioning_signal.unsqueeze(1)
         cond_embs = []
         for i in range(conditioning_signal.shape[1]):
             cond_embs.append(self.mel_embedding(conditioning_signal[:, i]))
         cond_emb = torch.stack(cond_embs, dim=1).mean(dim=1, keepdim=True)
-        text_codes = F.pad(text_codes, (1,0), value=self.START_TEXT_TOKEN)
-        text_codes = F.pad(text_codes, (0,1), value=self.STOP_TEXT_TOKEN)
-        _, enc_text = self.encoder(text_codes, return_hiddens=True)
-        # Interleave cond_emb into the first few contexts.
-        full_context = enc_text
-        full_context[1] = cond_emb
-        full_context[3] = cond_emb
-        full_context[6] = cond_emb
-        inference_model.store_context(full_context)
+        enc_text = self.encoder(text_codes, return_embeddings=True)
+        context = torch.cat([cond_emb, enc_text], dim=1)
+        self.inference_model.store_context(context)
 
-        gen = inference_model.generate(bos_token_id=self.START_TOKEN, pad_token_id=self.STOP_TOKEN, eos_token_id=self.STOP_TOKEN,
-                                       max_length=max_tokens, output_attentions=False, return_dict_in_generate=True, use_cache=True,
+        gen = self.inference_model.generate(bos_token_id=self.START_TOKEN, pad_token_id=self.STOP_TOKEN, eos_token_id=self.STOP_TOKEN,
+                                            max_length=max_tokens, output_attentions=False, return_dict_in_generate=True,
                                             **hf_generate_kwargs)
         return gen.sequences
 
 
-# @register_model
-# def register_autoregressive_codegen(opt_net, opt):
-#     return AutoregressiveCodegen(**opt_net['kwargs'])
+@register_model
+def register_autoregressive_codegen2(opt_net, opt):
+    return AutoregressiveCodegen(**opt_net['kwargs'])
 
 
 if __name__ == '__main__':
-    codegen = AutoregressiveCodegen(256, 10)
+    codegen = AutoregressiveCodegen(512, 20)
     torch.save(codegen.state_dict(), 'sample.pth')
-    #codegen.generate(torch.randn((1,80,120)), torch.randint(0,256,(1,200)))
+    codegen.generate(torch.randn((1,80,120)), torch.randint(0,256,(1,200)))
     codegen(torch.randint(0,256, (2,200)),
             torch.randn(2,80,120),
             torch.randint(0,8192, (2,350)),
